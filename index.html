@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>love</title>
+<title>Love</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
@@ -92,7 +92,6 @@
 <div class="overlay">
   <div class="name-glow"><div class="name-wrap"><span class="name">林瑶卿</span></div></div>
   <p class="sub">爱 你 喵</p>
-  <p class
 </div>
 
 <script>
@@ -104,40 +103,125 @@
 
   let W = 0, H = 0, DPR = 1, isMobile = false, minDim = 0;
 
+  /* =====================================================
+     尺寸 / 清晰度
+     - 按设备像素比渲染（移动端最高 3x，桌面 2.5x）
+     - 同时限制总像素预算，避免高分辨率下掉帧
+  ===================================================== */
   function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth;
     H = window.innerHeight;
+    isMobile = Math.min(W, H) < 720;
+    minDim = Math.min(W, H);
+
+    const rawDpr = window.devicePixelRatio || 1;
+    const MAX_PIXELS = isMobile ? 4.0e6 : 8.0e6;
+
+    let dpr = Math.min(rawDpr, isMobile ? 3 : 2.5);
+    const budget = Math.sqrt(MAX_PIXELS / Math.max(1, W * H));
+    if (budget < dpr) dpr = Math.max(1, budget);
+
+    DPR = dpr;
+
     canvas.width  = Math.round(W * DPR);
     canvas.height = Math.round(H * DPR);
     canvas.style.width  = W + 'px';
     canvas.style.height = H + 'px';
+
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    isMobile = Math.min(W, H) < 720;
-    minDim = Math.min(W, H);
   }
   window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
   resize();
 
   /* =====================================================
-     心形参数方程（y 已翻转，尖角朝下）
+     心形参数方程（y 翻转，尖角朝下）
+     ★ 关键修复：整体做包围盒居中，
+       使心形几何中心与爆炸点重合，避免内部填充
+       与轮廓错位（看起来像两颗半心叠在一起）
   ===================================================== */
+  const HEART_CY = 2.54;   // 原始曲线 y 包围盒中心偏移
+  const HEART_HX = 16;     // 半宽
+  const HEART_HY = 14.46;  // 半高（居中后）
+
   function heartPoint(t) {
     const s = Math.sin(t);
     return [
       16 * s * s * s,
-      -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t))
+      -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t)) - HEART_CY
     ];
+  }
+
+  /* ---- 轮廓按「弧长」均匀采样，避免凹口/尖端扎堆 ---- */
+  const OUTLINE_LUT = (function () {
+    const N = 1024;
+    const data = new Float64Array((N + 1) * 3); // x, y, 累计弧长
+    let acc = 0, px = 0, py = 0;
+    for (let i = 0; i <= N; i++) {
+      const p = heartPoint((i / N) * Math.PI * 2);
+      if (i > 0) acc += Math.hypot(p[0] - px, p[1] - py);
+      data[i * 3]     = p[0];
+      data[i * 3 + 1] = p[1];
+      data[i * 3 + 2] = acc;
+      px = p[0]; py = p[1];
+    }
+    return { data: data, n: N + 1, total: acc };
+  })();
+
+  function sampleOutline(u) {
+    const data = OUTLINE_LUT.data;
+    const n = OUTLINE_LUT.n;
+    const target = (u % 1) * OUTLINE_LUT.total;
+    let lo = 0, hi = n - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (data[mid * 3 + 2] < target) lo = mid + 1;
+      else hi = mid;
+    }
+    return [data[lo * 3], data[lo * 3 + 1]];
+  }
+
+  /* ---- 心形内部均匀取点（拒绝采样） ---- */
+  const HEART_POLY = (function () {
+    const N = 220, poly = [];
+    for (let i = 0; i < N; i++) poly.push(heartPoint((i / N) * Math.PI * 2));
+    return poly;
+  })();
+
+  function pointInPoly(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0], yi = poly[i][1];
+      const xj = poly[j][0], yj = poly[j][1];
+      if (((yi > y) !== (yj > y)) &&
+          (x < ((xj - xi) * (y - yi)) / (yj - yi) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  function randomPointInHeart(scale) {
+    const bx = HEART_HX * scale;
+    const by = HEART_HY * scale;
+    for (let k = 0; k < 16; k++) {
+      const x = (Math.random() * 2 - 1) * bx;
+      const y = (Math.random() * 2 - 1) * by;
+      if (pointInPoly(x, y, HEART_POLY)) return [x, y];
+    }
+    return [0, 0];
   }
 
   /* =====================================================
      预渲染光点精灵（白核 + 彩色光晕）
+     - 分辨率提到 96，缩放绘制更细腻
+     - 核心更锐利，光晕收敛 → 整体更"清晰"
   ===================================================== */
   const SPRITE_HUES = [335, 350, 318, 288, 45, 300, 0];
   const spriteMap = {};
 
   (function buildSprites() {
-    const S = 64, R = S / 2;
+    const S = 96, R = S / 2;
     for (let k = 0; k < SPRITE_HUES.length; k++) {
       const hue = SPRITE_HUES[k];
       const c = document.createElement('canvas');
@@ -145,9 +229,10 @@
       const g = c.getContext('2d');
       const grd = g.createRadialGradient(R, R, 0, R, R, R);
       grd.addColorStop(0.00, 'rgba(255,255,255,1)');
-      grd.addColorStop(0.16, 'hsla(' + hue + ',100%,92%,0.98)');
-      grd.addColorStop(0.34, 'hsla(' + hue + ',100%,74%,0.42)');
-      grd.addColorStop(0.62, 'hsla(' + hue + ',100%,64%,0.08)');
+      grd.addColorStop(0.10, 'hsla(' + hue + ',100%,95%,1)');
+      grd.addColorStop(0.24, 'hsla(' + hue + ',100%,80%,0.58)');
+      grd.addColorStop(0.48, 'hsla(' + hue + ',100%,68%,0.13)');
+      grd.addColorStop(0.75, 'hsla(' + hue + ',100%,62%,0.035)');
       grd.addColorStop(1.00, 'hsla(' + hue + ',100%,58%,0)');
       g.fillStyle = grd;
       g.fillRect(0, 0, S, S);
@@ -156,7 +241,6 @@
   })();
 
   function getSprite(hue) {
-    // 就近取色相精灵
     let best = SPRITE_HUES[0], bd = 999;
     for (let i = 0; i < SPRITE_HUES.length; i++) {
       const d = Math.abs(SPRITE_HUES[i] - hue);
@@ -203,7 +287,7 @@
   const particles = [];
   const flashes = [];
 
-  const MAX_PARTICLES = isMobile ? 620 : 1000;
+  const MAX_PARTICLES = isMobile ? 640 : 1040;
   const MAIN_HUES = [335, 350, 318, 288, 300];
   const GOLD_HUE = 45;
 
@@ -243,63 +327,60 @@
       hue: hue
     });
 
-    const outlineN = isMobile ? 62 : 82;
-    const innerN   = isMobile ? 16 : 24;
+    const outlineN = isMobile ? 64 : 88;
+    const innerN   = isMobile ? 18 : 26;
     const speedK   = minDim * 0.0215;
 
-    // ---- 爱心轮廓粒子：沿心形曲线分布，向外飞散 ----
+    /* ---- 爱心轮廓：弧长均匀采样，形状完整对称 ---- */
     for (let i = 0; i < outlineN; i++) {
-      const t = (i / outlineN) * Math.PI * 2 + (Math.random() - 0.5) * 0.06;
-      const hp = heartPoint(t);
-      const j = 0.90 + Math.random() * 0.22;
+      const hp = sampleOutline(i / outlineN);
+      const j = 0.93 + Math.random() * 0.14;   // 轻微厚度
 
       const pvx = hp[0] * speedK * j;
       const pvy = hp[1] * speedK * j;
 
-      const pHue = hue + (Math.random() - 0.5) * 26;
+      const pHue = hue + (Math.random() - 0.5) * 22;
 
       particles.push({
-        x: x + (Math.random() - 0.5) * 3,
-        y: y + (Math.random() - 0.5) * 3,
+        x: x + (Math.random() - 0.5) * 2,
+        y: y + (Math.random() - 0.5) * 2,
         px: x, py: y,
         vx: pvx, vy: pvy,
         life: 1,
-        maxLife: 1.25 + Math.random() * 0.65,
-        size: (isMobile ? 7 : 8) + Math.random() * 6,
+        maxLife: 1.30 + Math.random() * 0.60,
+        size: (isMobile ? 7 : 8) + Math.random() * 5,
         hue: pHue,
         sprite: getSprite(pHue),
         flick: Math.random() * Math.PI * 2,
-        drag: 1.55 + Math.random() * 0.35
+        drag: 1.55 + Math.random() * 0.30
       });
     }
 
-    // ---- 内部填充粒子：让爱心有体积感 ----
+    /* ---- 内部填充：在心形内部均匀取点，
+           与轮廓共用同一中心，形成完整实心爱心 ---- */
     for (let i = 0; i < innerN; i++) {
-      const t = Math.random() * Math.PI * 2;
-      const hp = heartPoint(t);
-      const r = Math.sqrt(Math.random()) * 0.82;
-      const j = 0.75 + Math.random() * 0.4;
+      const ip = randomPointInHeart(0.94);
+      const j = 0.88 + Math.random() * 0.20;
 
-      const pvx = hp[0] * r * speedK * j;
-      const pvy = hp[1] * r * speedK * j;
+      const pvx = ip[0] * speedK * j;
+      const pvy = ip[1] * speedK * j;
 
-      const pHue = hue + (Math.random() - 0.5) * 20;
+      const pHue = hue + (Math.random() - 0.5) * 18;
 
       particles.push({
         x: x, y: y,
         px: x, py: y,
         vx: pvx, vy: pvy,
         life: 1,
-        maxLife: 1.0 + Math.random() * 0.5,
-        size: (isMobile ? 5 : 6) + Math.random() * 5,
+        maxLife: 1.05 + Math.random() * 0.45,
+        size: (isMobile ? 4.5 : 5.5) + Math.random() * 4,
         hue: pHue,
         sprite: getSprite(pHue),
         flick: Math.random() * Math.PI * 2,
-        drag: 1.7 + Math.random() * 0.4
+        drag: 1.70 + Math.random() * 0.35
       });
     }
 
-    // 粒子超量时丢弃最旧的
     if (particles.length > MAX_PARTICLES) {
       particles.splice(0, particles.length - MAX_PARTICLES);
     }
@@ -338,12 +419,10 @@
       p.px = p.x;
       p.py = p.y;
 
-      // 空气阻力
       const damp = Math.exp(-p.drag * dt);
       p.vx *= damp;
       p.vy *= damp;
 
-      // 重力
       p.vy += 68 * dt;
 
       p.x += p.vx * dt;
@@ -370,7 +449,6 @@
       const r = rockets[i];
       const sprite = getSprite(r.hue);
 
-      // 拖尾：由旧到新，渐亮渐大
       for (let j = 0; j < r.trail.length; j++) {
         const tp = r.trail[j];
         const k = j / r.trail.length;
@@ -379,7 +457,6 @@
         ctx.drawImage(sprite, tp.x - s / 2, tp.y - s / 2, s, s);
       }
 
-      // 弹头
       const s = 15;
       ctx.globalAlpha = 0.95;
       ctx.drawImage(sprite, r.x - s / 2, r.y - s / 2, s, s);
@@ -420,31 +497,30 @@
       const t = p.life / p.maxLife;   // 1 → 0
       if (t <= 0) continue;
 
-      // 闪入 + 渐隐
+      // 闪入 + 渐隐（曲线更平滑，减少"糊"感）
       let alpha;
       if (t > 0.90) {
         alpha = (1 - t) / 0.10;
-      } else if (t < 0.35) {
-        alpha = t / 0.35;
+      } else if (t < 0.32) {
+        alpha = t / 0.32;
       } else {
         alpha = 1;
       }
-      alpha = alpha * alpha * 0.92;
+      alpha *= alpha * 0.95;
 
-      // 火花闪烁
-      const flick = 0.72 + 0.28 * Math.sin(T * 22 + p.flick);
+      // 火花闪烁（幅度减小，画面更干净）
+      const flick = 0.86 + 0.14 * Math.sin(T * 18 + p.flick);
       alpha *= flick;
       if (alpha <= 0.015) continue;
 
-      const sizeK = 0.35 + 0.65 * t;
+      const sizeK = 0.40 + 0.60 * t;
       const s = p.size * sizeK;
 
-      // 上一帧位置（拖尾）
-      const s2 = s * 0.72;
-      ctx.globalAlpha = alpha * 0.42;
+      // 极短拖尾（很淡，不拖泥带水）
+      const s2 = s * 0.60;
+      ctx.globalAlpha = alpha * 0.26;
       ctx.drawImage(p.sprite, p.px - s2 / 2, p.py - s2 / 2, s2, s2);
 
-      // 当前位置
       ctx.globalAlpha = alpha;
       ctx.drawImage(p.sprite, p.x - s / 2, p.y - s / 2, s, s);
     }
@@ -487,21 +563,16 @@
     prev = now;
     const T = (now - T0) / 1000;
 
-    // 自动发射烟花
     rocketTimer -= dt;
     if (rocketTimer <= 0) {
-      if (rockets.length < 5) {
-        launchRocket();
-      }
+      if (rockets.length < 5) launchRocket();
       rocketTimer = 0.62 + Math.random() * 0.85;
     }
 
-    // 更新
     updateRockets(dt);
     updateParticles(dt);
     updateFlashes(dt);
 
-    // 绘制
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.clearRect(0, 0, W, H);
 
@@ -513,7 +584,6 @@
     requestAnimationFrame(frame);
   }
 
-  // 开场立刻来一发
   setTimeout(function () {
     launchRocket(W * 0.5, H + 24, H * 0.30);
   }, 700);
